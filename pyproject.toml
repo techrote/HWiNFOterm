@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hwinfo-term"
+version = "0.1.0"
+description = "A Windows Terminal hardware monitor for HWiNFO shared memory"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "techrote" }]
+dependencies = []
+
+[project.scripts]
+hwinfo-term = "hwinfo_term.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
