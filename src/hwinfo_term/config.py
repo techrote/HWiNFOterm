@@ -22,6 +22,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pinned": [],
     "excluded_metrics": [],
     "history_keys": [],
+    "cards_keys": [],
+    "cards_initialized": False,
+    "cards_columns": 3,
+    "cards_column_widths": [],
+    "chrome_hidden": False,
     "history_chart_rows": {},
     "history_chart_styles": {},
     "history_show_averages": False,
@@ -91,7 +96,7 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
             if key in raw:
                 error = error or f"Invalid {key}; its default is active"
 
-    for key in ("pinned", "hidden_tiles", "watches", "events", "excluded_metrics", "history_keys"):
+    for key in ("pinned", "hidden_tiles", "watches", "events", "excluded_metrics", "history_keys", "cards_keys"):
         value = raw.get(key, cfg[key])
         if isinstance(value, list):
             cfg[key] = value[:512 if key in {"watches", "events"} else 4096]
@@ -101,7 +106,7 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
     for key in ("ascii", "mouse"):
         if isinstance(raw.get(key), bool):
             cfg[key] = raw[key]
-    for key in ("history_initialized", "metric_bar_labels", "history_show_averages"):
+    for key in ("history_initialized", "cards_initialized", "chrome_hidden", "metric_bar_labels", "history_show_averages"):
         if isinstance(raw.get(key), bool):
             cfg[key] = raw[key]
     try:
@@ -109,6 +114,11 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
     except (TypeError, ValueError, OverflowError):
         if "history_columns" in raw:
             error = error or "Invalid history_columns; its default is active"
+    try:
+        cfg["cards_columns"] = min(6, max(1, int(raw.get("cards_columns", cfg["cards_columns"]))))
+    except (TypeError, ValueError, OverflowError):
+        if "cards_columns" in raw:
+            error = error or "Invalid cards_columns; its default is active"
     raw_column_widths = raw.get("history_column_widths", [])
     if isinstance(raw_column_widths, list):
         column_widths = []
@@ -122,6 +132,19 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
         cfg["history_column_widths"] = column_widths
     elif "history_column_widths" in raw:
         error = error or "Invalid history_column_widths; defaults are active"
+    raw_cards_widths = raw.get("cards_column_widths", [])
+    if isinstance(raw_cards_widths, list):
+        cards_widths = []
+        for value in raw_cards_widths[:6]:
+            try:
+                width = float(value)
+                if math.isfinite(width) and width >= 0:
+                    cards_widths.append(min(100_000.0, width))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        cfg["cards_column_widths"] = cards_widths
+    elif "cards_column_widths" in raw:
+        error = error or "Invalid cards_column_widths; defaults are active"
     raw_stats_widths = raw.get("history_stats_widths", {})
     if isinstance(raw_stats_widths, dict):
         stats_widths = {}
@@ -193,7 +216,7 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
         pass
 
     cfg["pinned"] = list(dict.fromkeys(k for k in cfg["pinned"] if isinstance(k, str) and len(k) <= 64))
-    for key in ("excluded_metrics", "history_keys"):
+    for key in ("excluded_metrics", "history_keys", "cards_keys"):
         cfg[key] = list(dict.fromkeys(k for k in cfg[key] if isinstance(k, str) and len(k) <= 64))
     raw_chart_rows = raw.get("history_chart_rows", {})
     if isinstance(raw_chart_rows, dict):

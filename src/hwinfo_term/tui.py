@@ -42,16 +42,39 @@ class HitRegion:
         return self.x <= x < self.x + self.width and self.y <= y < self.y + self.height
 
 
+class ShiftedCanvas:
+    """Canvas view that moves page content while leaving chrome and footer fixed."""
+
+    def __init__(self, canvas: Canvas, y_offset: int):
+        self.canvas = canvas
+        self.y_offset = y_offset
+        self.ascii_only = canvas.ascii_only
+        self.height = canvas.height - y_offset
+        self.width = canvas.width
+
+    def put(self, x: int, y: int, *args: Any, **kwargs: Any) -> int:
+        return self.canvas.put(x, y + self.y_offset, *args, **kwargs)
+
+    def fill(self, x: int, y: int, width: int, *args: Any, **kwargs: Any) -> None:
+        self.canvas.fill(x, y + self.y_offset, width, *args, **kwargs)
+
+    def rect(self, x: int, y: int, width: int, height: int, *args: Any, **kwargs: Any) -> None:
+        self.canvas.rect(x, y + self.y_offset, width, height, *args, **kwargs)
+
+
 COMMANDS = [
     CommandSpec("view.dashboard", "Dashboard", "View", ("1",), "Show the tile workspace."),
     CommandSpec("view.sensors", "All sensors", "View", ("2",), "Browse and pin live HWiNFO readings."),
     CommandSpec("view.history", "History", "View", ("3",), "Inspect a selected reading over time."),
     CommandSpec("view.recent", "Recent History grid", "View", ("7",), "Show only recent-history metrics in a selectable grid."),
+    CommandSpec("view.cards", "Cards", "View", ("8",), "Show an independently arranged grid of sensor cards."),
     CommandSpec("view.alerts", "Alerts and events", "View", ("4",), "Review threshold watches and event history."),
     CommandSpec("view.theme", "Theme and palette", "View", ("5",), "Choose a semantic theme and inspect its LUT."),
     CommandSpec("view.source", "HWiNFO source", "View", ("6",), "Show provider connection and sample health."),
     CommandSpec("view.help", "Help", "View", ("?",), "Show keyboard, mouse, and feature help."),
+    CommandSpec("cards.add", "Add a sensor card", "Cards", (), "Add a card by searching the live sensor catalog."),
     CommandSpec("command_palette.open", "Command palette", "Navigate", ("ctrl+p",), "Search and invoke every application command."),
+    CommandSpec("ui.toggle_chrome", "Hide or show header", "Interface", ("f2",), "Collapse or restore the title, tab, and source rows."),
     CommandSpec("app.quit", "Quit HWiNFOterm", "Application", ("q", "ctrl+c"), "Close the TUI and restore the terminal."),
     CommandSpec("tile.focus_next", "Focus next tile", "Tiles", ("tab",), "Move focus through visible tiles."),
     CommandSpec("tile.maximize", "Maximize or restore tile", "Tiles", ("m",), "Give the focused tile the full workspace."),
@@ -143,6 +166,7 @@ class TUIApp:
         self.watch_delete_index = 0
         self.focused_tile = config.get("focused_tile", "metrics")
         self.tile_scroll = {tile: 0 for tile in TILES}
+        self.tile_scroll["cards"] = 0
         self.tile_order = [tile for tile in config.get("tile_order", TILES) if tile in TILES]
         for tile in TILES:
             if tile not in self.tile_order:
@@ -177,6 +201,11 @@ class TUIApp:
         self.previous_frame = None
         self.previous_size: tuple[int, int] | None = None
         self.drag: dict[str, Any] | None = None
+        self.cards_selected_index: int | None = None
+        self.cards_edit_index: int | None = None
+        self.cards_edit_append = False
+        self.cards_candidate_index = 0
+        self.draw_y_offset = 0
         warning = "Unknown saved theme; using LUTEX Night" if config.get("theme", "LUTEX Night") not in theme_names() else ""
         self.status_message = config_error or warning
         self.status_deadline = time.monotonic() + (8.0 if self.status_message else 0.0)
@@ -239,6 +268,9 @@ class TUIApp:
             self.view = command_id.split(".", 1)[1]
             if self.view in TILES:
                 self._tile_focus(self.view)
+            if self.view == "cards":
+                records, _ = self.store.snapshot()
+                self._initialize_cards(records)
             if self.view == "theme":
                 self._new_theme()
             return
@@ -248,6 +280,13 @@ class TUIApp:
             self.overlay = "palette"
             self.overlay_query = ""
             self.overlay_index = 0
+        elif command_id == "ui.toggle_chrome":
+            self.config["chrome_hidden"] = not bool(self.config.get("chrome_hidden", False))
+            self.previous_frame = None
+            self._save()
+            self._message("Header hidden · F2 shows it" if self.config["chrome_hidden"] else "Header shown · F2 hides it")
+        elif command_id == "cards.add":
+            self._open_cards_editor(None)
         elif command_id == "app.quit":
             self.quit_requested = True
         elif command_id == "tile.focus_next":
@@ -465,11 +504,21 @@ class TUIApp:
         self._save()
 
     def _set_history_columns(self, delta: int) -> None:
+        if self.view == "cards":
+            self._set_cards_columns(delta)
+            return
         columns = min(6, max(1, int(self.config.get("history_columns", 3)) + delta))
         self.config["history_columns"] = columns
         self.tile_scroll["recent"] = 0
         self._save()
         self._message(f"Recent History: {columns} column{'s' if columns != 1 else ''}")
+
+    def _set_cards_columns(self, delta: int) -> None:
+        columns = min(6, max(1, int(self.config.get("cards_columns", 3)) + delta))
+        self.config["cards_columns"] = columns
+        self.tile_scroll["cards"] = 0
+        self._save()
+        self._message(f"Cards: {columns} column{'s' if columns != 1 else ''}")
 
     def _history_chart_rows(self, key: str) -> int:
         values = self.config.setdefault("history_chart_rows", {})
@@ -485,6 +534,10 @@ class TUIApp:
             keys = self.config.get("history_keys", [])
         elif self.view == "recent":
             keys = self._active_history_keys()
+        elif self.view == "cards":
+            keys = self.config.get("cards_keys", [])
+            if self.cards_selected_index is not None and 0 <= self.cards_selected_index < len(keys):
+                return keys[self.cards_selected_index]
         else:
             return None
         return self.selected_sensor if self.selected_sensor in keys else (keys[0] if keys else None)
@@ -867,6 +920,8 @@ class TUIApp:
             return
         if self.drag["axis"] == "recent_column":
             self.config["history_column_widths"] = copy.deepcopy(self.drag["before_widths_setting"])
+        elif self.drag["axis"] == "cards_column":
+            self.config["cards_column_widths"] = copy.deepcopy(self.drag["before_widths_setting"])
         elif self.drag["axis"] == "recent_chart_split":
             key = self.drag["key"]
             widths = self.config.setdefault("history_stats_widths", {})
@@ -881,7 +936,9 @@ class TUIApp:
                 rows.pop(key, None)
             else:
                 rows[key] = self.drag["before_chart_rows"]
-        else:
+        elif self.drag["axis"] == "cards_reorder":
+            pass
+        elif self.drag["axis"] in {"column", "row"}:
             self.column_ratio = self.drag["before_column"]
             self.row_ratio = self.drag["before_row"]
         self.drag = None
@@ -904,6 +961,9 @@ class TUIApp:
         if self.overlay == "palette":
             self.overlay_query += value
             self.overlay_index = 0
+        elif self.overlay == "cards_edit":
+            self.overlay_query += value
+            self.cards_candidate_index = 0
         elif self.overlay == "filter":
             self.overlay_query += value
         elif self.overlay == "history_group_name":
@@ -971,6 +1031,9 @@ class TUIApp:
             self._dispatch_by_key(value.lower())
 
     def _handle_key(self, key: str, event: Event) -> None:
+        if key == "f2":
+            self._dispatch("ui.toggle_chrome")
+            return
         if self.overlay == "palette":
             if key == "escape" or key == "ctrl+p":
                 self.overlay = None
@@ -989,6 +1052,33 @@ class TUIApp:
             elif key == "ctrl+a":
                 self.overlay_query = ""
                 self.overlay_index = 0
+            return
+        if self.overlay == "cards_edit":
+            if key == "escape":
+                self.overlay = None
+                self.overlay_query = ""
+            elif key == "up":
+                self.cards_candidate_index = max(0, self.cards_candidate_index - 1)
+            elif key == "down":
+                records, _ = self.store.snapshot()
+                self.cards_candidate_index = min(
+                    max(0, len(self._card_candidates(records)) - 1),
+                    self.cards_candidate_index + 1,
+                )
+            elif key == "enter":
+                records, _ = self.store.snapshot()
+                candidates = self._card_candidates(records)
+                if candidates:
+                    index = min(self.cards_candidate_index, len(candidates) - 1)
+                    self._assign_card(candidates[index].reading.key)
+                else:
+                    self._message("No matching live sensors")
+            elif key == "backspace":
+                self.overlay_query = self.overlay_query[:-1]
+                self.cards_candidate_index = 0
+            elif key == "ctrl+a":
+                self.overlay_query = ""
+                self.cards_candidate_index = 0
             return
         if self.overlay == "filter":
             if key == "escape":
@@ -1102,6 +1192,9 @@ class TUIApp:
         if self.view == "recent" and key in {"up", "down"}:
             self._move_recent_selection(-1 if key == "up" else 1)
             return
+        if self.view == "cards" and key in {"up", "down"}:
+            self._move_cards_selection(-1 if key == "up" else 1)
+            return
 
         if key == "escape":
             if self.drag:
@@ -1127,19 +1220,21 @@ class TUIApp:
             if key in command.keys:
                 if command.id.startswith(("history.chart_rows_", "history.chart_style_")):
                     if not (
-                        self.view == "recent"
+                        self.view in {"recent", "cards"}
                         or (self.view == "dashboard" and self.focused_tile == "history")
                     ):
                         continue
                 elif command.id.startswith("history.stats_averages_"):
                     if not (
-                        self.view in {"recent", "history"}
+                        self.view in {"recent", "cards", "history"}
                         or (self.view == "dashboard" and self.focused_tile == "history")
                     ):
                         continue
-                elif command.id.startswith("history.") and self.view != "recent":
+                elif command.id.startswith("history.group_") and self.view != "recent":
                     continue
-                if self.view == "recent" and command.id.startswith(("layout.", "tile.")):
+                elif command.id.startswith("history.") and self.view not in {"recent", "cards"}:
+                    continue
+                if self.view in {"recent", "cards"} and command.id.startswith(("layout.", "tile.")):
                     continue
                 editor_commands = {
                     "theme.cycle", "theme.interpolation", "theme.anchor_prev", "theme.anchor_next",
@@ -1173,6 +1268,13 @@ class TUIApp:
         index = min(max(0, index + delta), len(keys) - 1)
         self.selected_sensor = keys[index]
 
+    def _move_cards_selection(self, delta: int) -> None:
+        keys = self.config.get("cards_keys", [])
+        if not keys:
+            return
+        index = self.cards_selected_index if self.cards_selected_index is not None else 0
+        self.cards_selected_index = min(max(0, index + delta), len(keys) - 1)
+
     def _scroll(self, delta: int, page: bool = False, tile: str | None = None) -> None:
         target = tile or (self.focused_tile if self.view == "dashboard" else self.view)
         amount = 6 if page else 3
@@ -1181,12 +1283,21 @@ class TUIApp:
     def _handle_mouse(self, event: Event) -> None:
         if event.action == "move" and self.drag:
             width, height = shutil.get_terminal_size((120, 40))
-            if self.drag["axis"] == "column":
+            if self.drag["axis"] == "cards_reorder":
+                if event.x != self.drag["start_x"] or event.y != self.drag["start_y"]:
+                    if not self.drag.get("moved"):
+                        self._message("Release over another card to move it · Esc cancels")
+                    self.drag["moved"] = True
+                target = self._hit(event.x, event.y)
+                if target and target.action == "cards_card":
+                    self.drag["target_index"] = int(target.payload)
+            elif self.drag["axis"] == "column":
                 available = max(1, width - 3)
                 self.column_ratio = min(0.78, max(0.22, (event.x - 1) / available))
             elif self.drag["axis"] == "row":
-                body_height = max(1, height - 6)
-                self.row_ratio = min(0.78, max(0.22, (event.y - 3) / body_height))
+                top = 1 if self.config.get("chrome_hidden") else 3
+                body_height = max(1, height - top - 3)
+                self.row_ratio = min(0.78, max(0.22, (event.y - top) / body_height))
             elif self.drag["axis"] == "recent_column":
                 widths = self.drag["before_widths"].copy()
                 column = self.drag["column"]
@@ -1196,6 +1307,15 @@ class TUIApp:
                 widths[column] = left_width
                 widths[column + 1] = pair_width - left_width
                 self._set_recent_column_widths(widths)
+            elif self.drag["axis"] == "cards_column":
+                widths = self.drag["before_widths"].copy()
+                column = self.drag["column"]
+                pair_width = widths[column] + widths[column + 1]
+                left_width = widths[column] + event.x - self.drag["start_x"]
+                left_width = min(pair_width - 24, max(24, left_width))
+                widths[column] = left_width
+                widths[column + 1] = pair_width - left_width
+                self._set_cards_column_widths(widths)
             elif self.drag["axis"] == "recent_card":
                 key = self.drag["key"]
                 rows = min(
@@ -1214,9 +1334,26 @@ class TUIApp:
         if event.action == "release" and self.drag:
             drag = self.drag
             self.drag = None
+            if drag["axis"] == "cards_reorder":
+                source = int(drag["source_index"])
+                target = drag.get("target_index")
+                keys = self.config.setdefault("cards_keys", [])
+                if not drag.get("moved"):
+                    self.cards_selected_index = source
+                    self._open_cards_editor(source)
+                elif target is not None and 0 <= source < len(keys) and 0 <= int(target) < len(keys):
+                    target = int(target)
+                    if target != source:
+                        keys[source], keys[target] = keys[target], keys[source]
+                        self.cards_selected_index = target
+                        self._save()
+                        self._message("Card order updated")
+                return
             self._save()
             if drag["axis"] == "recent_column":
                 self._message("Recent History column widths updated")
+            elif drag["axis"] == "cards_column":
+                self._message("Cards column widths updated")
             elif drag["axis"] == "recent_card":
                 self._message(f"History chart height: {self.config['history_chart_rows'][drag['key']]} rows")
             elif drag["axis"] == "recent_chart_split":
@@ -1242,7 +1379,7 @@ class TUIApp:
                 self.last_right_click = None
                 return
             hit = self._hit(event.x, event.y)
-            if hit and hit.action in {"metric_select", "history_select", "recent_metric_select"}:
+            if hit and hit.action in {"metric_select", "history_select", "recent_metric_select", "cards_card"}:
                 now = time.monotonic()
                 target = (hit.action, str(hit.payload))
                 is_double = bool(self.last_right_click and now - self.last_right_click[0] <= 0.5 and self.last_right_click[1:] == target)
@@ -1250,6 +1387,8 @@ class TUIApp:
                 if is_double:
                     if hit.action == "metric_select":
                         self._remove_metric(str(hit.payload))
+                    elif hit.action == "cards_card":
+                        self._remove_card(int(hit.payload))
                     else:
                         self._remove_history_metric(str(hit.payload))
                 else:
@@ -1268,7 +1407,8 @@ class TUIApp:
                 "watch_save", "watch_cancel", "watch_delete_confirm", "watch_delete_cancel",
                 "theme_hex_save", "theme_hex_cancel", "history_group_cycle", "history_group_action",
                 "history_group_metric", "history_group_name_save", "history_group_name_cancel",
-                "history_group_delete_confirm", "history_group_delete_cancel",
+                "history_group_delete_confirm", "history_group_delete_cancel", "cards_candidate",
+                "cards_remove",
             }
             if hit and hit.action in overlay_actions:
                 self._activate_hit(hit)
@@ -1285,6 +1425,17 @@ class TUIApp:
                 "column": int(payload.get("column", 0)),
                 "before_widths": list(payload.get("widths", [])),
                 "before_widths_setting": copy.deepcopy(self.config.get("history_column_widths", [])),
+                "start_x": event.x,
+            }
+            return
+        if hit and hit.action == "cards_column_resize":
+            payload = hit.payload if isinstance(hit.payload, dict) else {}
+            self.last_click = None
+            self.drag = {
+                "axis": "cards_column",
+                "column": int(payload.get("column", 0)),
+                "before_widths": list(payload.get("widths", [])),
+                "before_widths_setting": copy.deepcopy(self.config.get("cards_column_widths", [])),
                 "start_x": event.x,
             }
             return
@@ -1320,6 +1471,18 @@ class TUIApp:
                 "axis": "column" if hit.action == "column_divider" else "row",
                 "before_column": self.column_ratio,
                 "before_row": self.row_ratio,
+            }
+            return
+        if hit and hit.action == "cards_card":
+            self.last_click = None
+            self.cards_selected_index = int(hit.payload)
+            self.drag = {
+                "axis": "cards_reorder",
+                "source_index": int(hit.payload),
+                "target_index": int(hit.payload),
+                "start_x": event.x,
+                "start_y": event.y,
+                "moved": False,
             }
             return
         if hit and hit.action in {"sensor_select", "metric_select"}:
@@ -1371,6 +1534,11 @@ class TUIApp:
             self._tile_focus("history")
         elif hit.action == "recent_metric_select":
             self.selected_sensor = str(hit.payload)
+        elif hit.action == "cards_candidate":
+            self._assign_card(str(hit.payload))
+        elif hit.action == "cards_remove":
+            if self.cards_edit_index is not None:
+                self._remove_card(self.cards_edit_index)
         elif hit.action == "history_group_cycle":
             self._cycle_history_group(int(hit.payload))
         elif hit.action == "history_group_action":
@@ -1461,24 +1629,38 @@ class TUIApp:
                     if width < 40 or height < 10:
                         self._draw_resize_prompt(canvas, width, height)
                     else:
-                        self._draw_chrome(canvas, width, height, records, status)
-                        if self.view == "dashboard":
-                            self._draw_dashboard(canvas, width, height, records, status)
-                        elif self.view == "sensors":
-                            self._draw_sensors_page(canvas, width, height, records)
-                        elif self.view == "history":
-                            self._draw_history_page(canvas, width, height, records)
-                        elif self.view == "recent":
-                            self._draw_recent_page(canvas, width, height, records)
-                        elif self.view == "alerts":
-                            self._draw_alerts_page(canvas, width, height, records)
-                        elif self.view == "theme":
-                            self._draw_theme_page(canvas, width, height)
-                        elif self.view == "source":
-                            self._draw_source_page(canvas, width, height, records, status)
+                        if self.config.get("chrome_hidden"):
+                            self.draw_y_offset = 0
+                            self._draw_compact_chrome(canvas, width)
+                            page_canvas = ShiftedCanvas(canvas, -2)
+                            self.draw_y_offset = -2
+                            page_height = height + 4
                         else:
-                            self._draw_help_page(canvas, width, height)
-                        self._draw_footer(canvas, width, height, records, status)
+                            self._draw_chrome(canvas, width, height, records, status)
+                            page_canvas = canvas
+                            self.draw_y_offset = 0
+                            page_height = height
+                        if self.view == "dashboard":
+                            self._draw_dashboard(page_canvas, width, page_height, records, status)
+                        elif self.view == "sensors":
+                            self._draw_sensors_page(page_canvas, width, page_height, records)
+                        elif self.view == "history":
+                            self._draw_history_page(page_canvas, width, page_height, records)
+                        elif self.view == "recent":
+                            self._draw_recent_page(page_canvas, width, page_height, records)
+                        elif self.view == "cards":
+                            self._draw_cards_page(page_canvas, width, page_height, records)
+                        elif self.view == "alerts":
+                            self._draw_alerts_page(page_canvas, width, page_height, records)
+                        elif self.view == "theme":
+                            self._draw_theme_page(page_canvas, width, page_height)
+                        elif self.view == "source":
+                            self._draw_source_page(page_canvas, width, page_height, records, status)
+                        else:
+                            self._draw_help_page(page_canvas, width, page_height)
+                        self.draw_y_offset = 0
+                        if not self.config.get("chrome_hidden"):
+                            self._draw_footer(canvas, width, height, records, status)
                         if self.overlay:
                             self._draw_overlay(canvas, width, height, records)
                     output, self.previous_frame = canvas.render(self.theme, self.previous_frame)
@@ -1500,7 +1682,7 @@ class TUIApp:
 
     def _register(self, x: int, y: int, width: int, height: int, action: str, payload: Any = None) -> None:
         if width > 0 and height > 0:
-            self.hits.append(HitRegion(x, y, width, height, action, payload))
+            self.hits.append(HitRegion(x, y + self.draw_y_offset, width, height, action, payload))
 
     def _draw_resize_prompt(self, canvas: Canvas, width: int, height: int) -> None:
         message = "Resize Windows Terminal to at least 40 × 10 cells"
@@ -1508,27 +1690,33 @@ class TUIApp:
 
     def _draw_chrome(self, canvas: Canvas, width: int, height: int, records: dict[str, SensorRecord], status: SourceStatus) -> None:
         canvas.fill(0, 0, width, " ", "text.primary", "surface.base")
+        hide_label = "HIDE"
+        canvas.put(1, 0, hide_label, "text.inverse", "accent.primary", True)
+        self._register(1, 0, len(hide_label), 1, "command", "ui.toggle_chrome")
         title = "HWiNFOterm"
         marker = "  SIMULATED DATA" if self.demo else "  HWiNFO SM2"
         if width >= 60 and not self.demo:
             marker = "  WINDOWS TERMINAL · HWiNFO SM2"
-        canvas.put(1, 0, title, "accent.primary", "surface.base", True)
-        canvas.put(1 + len(title), 0, marker, "text.secondary", "surface.base")
+        title_x = 7
+        canvas.put(title_x, 0, title, "accent.primary", "surface.base", True)
+        canvas.put(title_x + len(title), 0, marker, "text.secondary", "surface.base")
         clock = dt.datetime.now().strftime("%H:%M:%S")
-        canvas.put(max(0, width - len(clock) - 2), 0, clock, "text.secondary", "surface.base")
+        if width >= 76:
+            canvas.put(max(0, width - len(clock) - 2), 0, clock, "text.secondary", "surface.base")
 
         tabs = [
             ("Dashboard", "view.dashboard", "dashboard"),
             ("Sensors", "view.sensors", "sensors"),
             ("History", "view.history", "history"),
             ("Recent", "view.recent", "recent"),
+            ("Cards", "view.cards", "cards"),
             ("Alerts", "view.alerts", "alerts"),
             ("Theme", "view.theme", "theme"),
             ("Source", "view.source", "source"),
             ("Help", "view.help", "help"),
         ]
         if width < 112:
-            tabs = [(short, command, view) for short, (_, command, view) in zip(("D", "S", "H", "N", "A", "T", "R", "?"), tabs)]
+            tabs = [(short, command, view) for short, (_, command, view) in zip(("D", "S", "H", "N", "C", "A", "T", "R", "?"), tabs)]
         x = 1
         for label, command, view in tabs:
             text = f" {label} "
@@ -1537,8 +1725,9 @@ class TUIApp:
             self._register(x, 1, len(text), 1, "command", command)
             x += len(text) + 1
         cmd_label = "[C]" if width < 112 else "[ Commands · Ctrl+P ]"
-        canvas.put(max(x + 1, width - len(cmd_label) - 2), 1, cmd_label, "accent.secondary", "surface.base", True)
-        self._register(max(x + 1, width - len(cmd_label) - 2), 1, len(cmd_label), 1, "command", "command_palette.open")
+        cmd_x = max(x + 1, width - len(cmd_label) - 2)
+        canvas.put(cmd_x, 1, cmd_label, "accent.secondary", "surface.base", True)
+        self._register(cmd_x, 1, len(cmd_label), 1, "command", "command_palette.open")
 
         state_colour = "status.success" if status.state in {"connected", "demo"} else "status.warning" if status.state in {"stale", "connecting"} else "status.error"
         sensor_count = len(records)
@@ -1548,6 +1737,12 @@ class TUIApp:
         source_text = f"{status.state.upper()}  ·  {sensor_count} readings  ·  last change {age}  ·  {status.message}"
         canvas.fill(0, 2, width, " ", "text.secondary", "surface.raised")
         canvas.put(1, 2, source_text, state_colour, "surface.raised", status.state in {"stale", "unavailable"})
+
+    def _draw_compact_chrome(self, canvas: Canvas, width: int) -> None:
+        label = "SHOW"
+        canvas.fill(0, 0, width, " ", "text.secondary", "surface.raised")
+        canvas.put(1, 0, label, "text.inverse", "accent.primary", True)
+        self._register(1, 0, len(label), 1, "command", "ui.toggle_chrome")
 
     def _draw_footer(self, canvas: Canvas, width: int, height: int, records: dict[str, SensorRecord], status: SourceStatus) -> None:
         if height < 2:
@@ -1573,14 +1768,17 @@ class TUIApp:
             hints = "↑↓ change sensor   2 all sensors   1 dashboard   Ctrl+P commands   Q quit"
         elif self.view == "recent":
             hints = "←→ group   ↑↓ select metric   [ ] columns   G manage groups   wheel scroll   Q quit"
+        elif self.view == "cards":
+            hints = "Click card to edit   drag to reorder   ↑↓ select   [ ] columns   ,/. height   ; style   A averages"
         elif self.view == "alerts":
             hints = "↑↓ select watch   W add   X remove   1 dashboard   Ctrl+P commands   Q quit"
         elif self.view == "theme":
             hints = "← → select   ↑ ↓ hue   A/X add/remove   H hex   Enter commit   Esc cancel   Ctrl+P commands" if self.theme_editing else "T next theme   E palette composer   Ctrl+P commands   Q quit"
         elif self.view == "source":
-            hints = "1 dashboard   2 sensors   3 history   7 recent   4 alerts   5 themes   Ctrl+P commands   Q quit"
+            hints = "1 dashboard   2 sensors   3 history   7 recent   8 cards   4 alerts   5 themes   Ctrl+P commands   Q quit"
         else:
-            hints = "1–7 navigate   ? help   Ctrl+P commands   Q quit"
+            hints = "1–8 navigate   ? help   Ctrl+P commands   Q quit"
+        hints += "   F2 hide/show header"
         canvas.fill(0, hint_y, width, " ", "text.secondary", "surface.base")
         canvas.put(1, hint_y, hints, "text.secondary", "surface.base", max_width=width - 2)
 
@@ -1975,8 +2173,32 @@ class TUIApp:
         widths[-1] += available - sum(widths)
         return widths
 
+    def _cards_column_widths(self, width: int, columns: int) -> list[int]:
+        available = max(columns, width - 2 - (columns - 1))
+        extra = max(0, available - columns * 24)
+        configured = self.config.get("cards_column_widths", [])
+        if not isinstance(configured, list) or len(configured) != columns:
+            weights = [1.0] * columns
+        else:
+            weights = []
+            for value in configured:
+                try:
+                    weight = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    weight = 0.0
+                weights.append(weight if math.isfinite(weight) and weight > 0 else 0.0)
+            if not any(weights):
+                weights = [1.0] * columns
+        total = sum(weights)
+        widths = [24 + int(extra * weight / total) for weight in weights]
+        widths[-1] += available - sum(widths)
+        return widths
+
     def _set_recent_column_widths(self, widths: list[int]) -> None:
         self.config["history_column_widths"] = [float(max(0, width - 24)) for width in widths]
+
+    def _set_cards_column_widths(self, widths: list[int]) -> None:
+        self.config["cards_column_widths"] = [float(max(0, width - 24)) for width in widths]
 
     def _rolling_average(self, samples: list[tuple[float, float]], seconds: float) -> float | None:
         if not samples:
@@ -2128,6 +2350,76 @@ class TUIApp:
         del keys[8:]
         self.config["history_initialized"] = True
         self._save()
+
+    def _initialize_cards(self, records: dict[str, SensorRecord]) -> None:
+        if self.config.get("cards_initialized"):
+            return
+        self._initialize_recent_history(records)
+        keys = list(self._active_history_keys())
+        if not keys and not records and not self.config.get("history_initialized"):
+            return
+        self.config["cards_keys"] = list(dict.fromkeys(keys))
+        self.config["cards_initialized"] = True
+        self.cards_selected_index = 0 if self.config["cards_keys"] else None
+        self._save()
+
+    def _open_cards_editor(self, index: int | None) -> None:
+        keys = self.config.setdefault("cards_keys", [])
+        self.cards_edit_append = index is None
+        self.cards_edit_index = None if index is None else min(max(0, index), max(0, len(keys) - 1))
+        self.cards_candidate_index = 0
+        self.overlay_query = ""
+        self.overlay = "cards_edit"
+
+    def _card_candidates(self, records: dict[str, SensorRecord]) -> list[SensorRecord]:
+        query = self.overlay_query.casefold().strip()
+        matches: list[tuple[int, str, SensorRecord]] = []
+        for record in records.values():
+            reading = record.reading
+            searchable = " ".join((
+                str(getattr(reading, "label", "")),
+                str(getattr(reading, "sensor", "")),
+                str(getattr(reading, "unit", "")),
+                str(getattr(reading, "key", "")),
+            )).casefold()
+            if query and query not in searchable:
+                continue
+            label = str(getattr(reading, "label", ""))
+            priority = 0 if query and label.casefold().startswith(query) else 1
+            matches.append((priority, label.casefold(), record))
+        matches.sort(key=lambda item: (item[0], item[1], item[2].reading.key))
+        return [record for _, _, record in matches]
+
+    def _assign_card(self, key: str) -> None:
+        keys = self.config.setdefault("cards_keys", [])
+        if self.cards_edit_append:
+            if len(keys) >= 256:
+                self._message("Cards supports up to 256 cards")
+                return
+            keys.append(key)
+            self.cards_selected_index = len(keys) - 1
+        elif self.cards_edit_index is not None and keys:
+            index = min(self.cards_edit_index, len(keys) - 1)
+            keys[index] = key
+            self.cards_selected_index = index
+        self.config["cards_initialized"] = True
+        self.overlay = None
+        self.overlay_query = ""
+        self._save()
+        records, _ = self.store.snapshot()
+        label = records[key].reading.label if key in records else key
+        self._message(f"Card set to {label}")
+
+    def _remove_card(self, index: int) -> None:
+        keys = self.config.setdefault("cards_keys", [])
+        if 0 <= index < len(keys):
+            removed = keys.pop(index)
+            self.cards_selected_index = min(index, len(keys) - 1) if keys else None
+            self.overlay = None
+            self._save()
+            records, _ = self.store.snapshot()
+            label = records[removed].reading.label if removed in records else removed
+            self._message(f"Removed {label} from Cards")
 
     def _draw_history_graph(self, canvas: Canvas, x: int, y: int, width: int, height: int, records: dict[str, SensorRecord], mini: bool = False) -> None:
         if mini:
@@ -2411,7 +2703,7 @@ class TUIApp:
                     chart_rows,
                 )
                 visible_card_count += 1
-                y += card_height + 1
+                y += card_height
 
         for column in range(columns - 1):
             divider_x = column_xs[column] + column_widths[column]
@@ -2428,6 +2720,108 @@ class TUIApp:
         if visible_card_count < len(item_records) - scroll_row * columns:
             canvas.put(max(2, width - 30), height - 3, f"Card set {scroll_row + 1} of {total_rows} · wheel scrolls", "text.disabled", "surface.base", max_width=28)
 
+    def _draw_cards_page(self, canvas: Canvas, width: int, height: int, records: dict[str, SensorRecord]) -> None:
+        self._initialize_cards(records)
+        chrome_hidden = bool(self.config.get("chrome_hidden"))
+        keys = self.config.setdefault("cards_keys", [])
+        if keys:
+            if self.cards_selected_index is None:
+                self.cards_selected_index = 0
+            self.cards_selected_index = min(max(0, self.cards_selected_index), len(keys) - 1)
+        else:
+            self.cards_selected_index = None
+
+        configured_columns = min(6, max(1, int(self.config.get("cards_columns", 3))))
+        columns = min(configured_columns, max(1, min(6, (width - 3) // 24)))
+        if not chrome_hidden:
+            canvas.put(1, 3, "CARDS", "accent.primary", "surface.base", True)
+            add_label = "[ + Add card ]"
+            plus, minus = "[+]", "[-]"
+            add_x = width - len(add_label) - 2
+            plus_x = add_x - len(plus) - 1
+            columns_label = f"{columns} col"
+            label_x = plus_x - len(columns_label) - 1
+            minus_x = label_x - len(minus) - 1
+            canvas.put(minus_x, 3, minus, "accent.secondary", "surface.base", True)
+            self._register(minus_x, 3, len(minus), 1, "command", "history.columns_less")
+            canvas.put(label_x, 3, columns_label, "text.secondary", "surface.base")
+            canvas.put(plus_x, 3, plus, "accent.secondary", "surface.base", True)
+            self._register(plus_x, 3, len(plus), 1, "command", "history.columns_more")
+            canvas.put(add_x, 3, add_label, "accent.secondary", "surface.base", True)
+            self._register(add_x, 3, len(add_label), 1, "command", "cards.add")
+
+            selected_key = keys[self.cards_selected_index] if self.cards_selected_index is not None else None
+            selected_record = records.get(selected_key) if selected_key else None
+            selected_label = selected_record.reading.label if selected_record else selected_key or "none"
+            selected_rows = self._history_chart_rows(selected_key) if selected_key else 1
+            selected_style = self._history_chart_style(selected_key) if selected_key else "block"
+            canvas.put(2, 4, f"Click a card to choose a sensor · drag cards to reorder · {selected_label} · {selected_style.title()} {selected_rows}L · ,/. height ; style", "text.secondary", "surface.base", max_width=width - 4)
+
+        item_cards = [(index, records[key]) for index, key in enumerate(keys) if key in records]
+        if not item_cards:
+            message = "Add a card, then type to search the live HWiNFO sensor catalog." if not keys else "Waiting for the card's HWiNFO reading to return."
+            canvas.put(2, 3 if chrome_hidden else 6, message, "text.secondary", "surface.base", max_width=width - 4)
+            return
+
+        grid_top = 3 if chrome_hidden else 5
+        grid_bottom = height - 2
+        grid_height = max(1, grid_bottom - grid_top)
+        if grid_height < 6:
+            canvas.put(2, grid_top, "Resize the terminal to show Cards.", "status.warning", "surface.base", max_width=width - 4)
+            return
+        total_rows = math.ceil(len(item_cards) / columns)
+        scroll_row = min(max(0, total_rows - 1), max(0, self.tile_scroll.get("cards", 0)))
+        column_widths = self._cards_column_widths(width, columns)
+        column_xs: list[int] = []
+        column_x = 1
+        for column_width in column_widths:
+            column_xs.append(column_x)
+            column_x += column_width + 1
+
+        average_rows = 4 if self.config.get("history_show_averages") else 2
+        visible_card_count = 0
+        for column, column_width in enumerate(column_widths):
+            x = column_xs[column]
+            y = grid_top
+            column_cards = item_cards[column + scroll_row * columns :: columns]
+            for card_index, record in column_cards:
+                chart_rows = self._history_chart_rows(record.reading.key)
+                metric_stats_rows = average_rows if self._metric_history_stats_width(record.reading.key, column_width) else 0
+                card_height = max(6, max(chart_rows, metric_stats_rows) + 4)
+                remaining = grid_bottom - y
+                if remaining < 6:
+                    break
+                rendered_height = min(card_height, remaining)
+                self._draw_recent_metric_card(
+                    canvas,
+                    x,
+                    y,
+                    column_width,
+                    rendered_height,
+                    record,
+                    card_index == self.cards_selected_index,
+                    chart_rows,
+                    selection_action="cards_card",
+                    selection_payload=card_index,
+                )
+                visible_card_count += 1
+                y += card_height
+
+        for column in range(columns - 1):
+            divider_x = column_xs[column] + column_widths[column]
+            grip = "↔" if not self.ascii_only else "|"
+            canvas.put(divider_x, grid_top, grip, "accent.secondary", "surface.base", True)
+            self._register(
+                divider_x,
+                grid_top,
+                1,
+                grid_height,
+                "cards_column_resize",
+                {"column": column, "widths": column_widths.copy()},
+            )
+        if visible_card_count < len(item_cards) - scroll_row * columns:
+            canvas.put(max(2, width - 30), height - 3, f"Card set {scroll_row + 1} of {total_rows} · wheel scrolls", "text.disabled", "surface.base", max_width=28)
+
     def _draw_recent_metric_card(
         self,
         canvas: Canvas,
@@ -2438,6 +2832,8 @@ class TUIApp:
         record: SensorRecord,
         selected: bool,
         chart_rows: int | None = None,
+        selection_action: str = "recent_metric_select",
+        selection_payload: Any = None,
     ) -> None:
         border = "accent.primary" if selected else "border.normal"
         canvas.rect(x, y, width, height, border, "surface.tile")
@@ -2485,7 +2881,7 @@ class TUIApp:
                 plot_width,
             )
         canvas.put(x + 2, y + height - 2, footer, "text.disabled", "surface.tile", max_width=max(0, width - 4))
-        self._register(x, y, width, height, "recent_metric_select", record.reading.key)
+        self._register(x, y, width, height, selection_action, record.reading.key if selection_payload is None else selection_payload)
         if stats_width:
             splitter_x = plot_x + plot_width
             splitter_y = plot_y + max(0, available_plot_height // 2)
@@ -2598,10 +2994,12 @@ class TUIApp:
             "The Dashboard is a persistent tile workspace: focus, hide, restore, maximize, reorder, and resize its splits.",
             "All application commands appear in the mouse-operable command palette (Ctrl+P or the top-right Commands button).",
             "",
-            "1 Dashboard   2 Sensors   3 History   7 Recent   4 Alerts   5 Theme   6 Source   ? Help",
+            "1 Dashboard   2 Sensors   3 History   7 Recent   8 Cards   4 Alerts   5 Theme   6 Source   ? Help",
             "Tab focus   M maximize   H hide   R restore   V move tile   0 reset layout   [ ] / - = adjust splits",
             "/ filter   P pin/unpin   W watch   B in-bar labels   G history groups   T theme   E palette   Q quit",
             "Recent: 7 tab   ←→ group   [ ] columns   G manage metric groups   ↑↓ select metric.",
+            "Cards: 8 tab   click a card then type to search sensor readings   Enter assign   drag to reorder   double-right-click to remove.",
+            "F2 or the fixed HIDE/SHOW button hides/restores the title, tabs, source status, and footer.",
             "Recent chart: ,/. set 1–8 rows; ; cycles Block/Stem/Point; A toggles 1m/5m averages.",
             "Recent cards: drag the chart/readout divider to resize plot width; the bottom-right corner changes chart height. Column gutters resize all cards in that column.",
             "Dashboard history tile: click a metric row to select it, then use the same chart controls.",
@@ -2617,7 +3015,7 @@ class TUIApp:
         for index, line in enumerate(lines):
             if 5 + index >= height - 2:
                 break
-            role = "accent.secondary" if line.startswith(("1 Dashboard", "Tab focus", "Mouse:")) else "text.secondary"
+            role = "accent.secondary" if line.startswith(("1 Dashboard", "Tab focus", "Cards:", "Mouse:")) else "text.secondary"
             canvas.put(2, 5 + index, line, role, "surface.base", max_width=width - 4)
 
     def _filtered_commands(self) -> list[CommandSpec]:
@@ -2649,6 +3047,8 @@ class TUIApp:
     def _draw_overlay(self, canvas: Canvas, width: int, height: int, records: dict[str, SensorRecord]) -> None:
         if self.overlay == "palette":
             self._draw_command_palette(canvas, width, height)
+        elif self.overlay == "cards_edit":
+            self._draw_cards_edit(canvas, width, height, records)
         elif self.overlay == "filter":
             self._draw_filter_overlay(canvas, width, height)
         elif self.overlay == "watch_form":
@@ -2663,6 +3063,43 @@ class TUIApp:
             self._draw_history_group_name(canvas, width, height)
         elif self.overlay == "history_group_delete":
             self._draw_history_group_delete(canvas, width, height)
+
+    def _draw_cards_edit(self, canvas: Canvas, width: int, height: int, records: dict[str, SensorRecord]) -> None:
+        candidates = self._card_candidates(records)
+        box_height = min(height - 2, max(9, min(17, len(candidates) + 6)))
+        x, y, box_width, box_height = self._overlay_box(
+            canvas,
+            width,
+            height,
+            min(84, width - 4),
+            box_height,
+            "ADD SENSOR CARD" if self.cards_edit_append else "SET CARD SENSOR",
+        )
+        prompt_label = "Search live sensors:"
+        canvas.put(x + 2, y + 2, prompt_label, "text.secondary", "surface.raised")
+        canvas.fill(x + 2, y + 3, box_width - 4, " ", "text.primary", "surface.tile")
+        canvas.put(x + 3, y + 3, self.overlay_query or "type to filter by sensor, reading, unit, or key…", "text.primary" if self.overlay_query else "text.disabled", "surface.tile", max_width=box_width - 6)
+        visible_rows = max(1, box_height - 6)
+        self.cards_candidate_index = min(self.cards_candidate_index, max(0, len(candidates) - 1))
+        first = max(0, min(max(0, len(candidates) - visible_rows), self.cards_candidate_index - visible_rows + 1))
+        for offset, record in enumerate(candidates[first : first + visible_rows]):
+            index = first + offset
+            row_y = y + 4 + offset
+            selected = index == self.cards_candidate_index
+            background = "state.selected" if selected else "surface.raised"
+            reading = record.reading
+            text = f"{reading.label}  ·  {reading.sensor}  ·  {reading.unit}"
+            canvas.put(x + 2, row_y, text, "text.primary" if selected else "text.secondary", background, selected, max_width=box_width - 4)
+            self._register(x + 1, row_y, box_width - 2, 1, "cards_candidate", reading.key)
+        if not candidates:
+            canvas.put(x + 2, y + 5, "No live readings match. Clear the search or wait for HWiNFO.", "text.disabled", "surface.raised", max_width=box_width - 4)
+        footer_y = y + box_height - 2
+        canvas.put(x + 2, footer_y, "↑↓ choose · Enter assign · Esc cancel", "text.disabled", "surface.raised", max_width=box_width - 4)
+        if not self.cards_edit_append:
+            remove = "[ Remove card ]"
+            remove_x = x + box_width - len(remove) - 2
+            canvas.put(remove_x, footer_y, remove, "status.error", "surface.raised", True)
+            self._register(remove_x, footer_y, len(remove), 1, "cards_remove")
 
     def _draw_command_palette(self, canvas: Canvas, width: int, height: int) -> None:
         commands = self._filtered_commands()
