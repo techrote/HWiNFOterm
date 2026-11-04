@@ -27,7 +27,7 @@ HWiNFOterm needs Python 3.11 or newer and a Windows Terminal session. It uses th
 - Set each tracked metric's history chart height from 1–8 rows with `,` and `.` and cycle its Block (default), Stem, or Point presentation with `;`. Settings persist per metric.
 - History charts include a slim right-side readout for the visible Y-axis peak and recorded maximum. Press `A` on History, Recent, Cards, or the focused dashboard History tile to show or hide 1-minute and 5-minute rolling averages; averages appear after each full window has been collected.
 - History colours map each chart's current visible value range across the full theme LUT, independently of chart height.
-- Add hysteresis watches with separate trigger and rearm values and an optional continuous duration. Watch state and a bounded event log persist locally.
+- Add hysteresis watches with separate trigger and rearm values and an optional continuous duration. Pending durations restart after below-trigger samples, source interruptions, or missed observations; active watches retain their state until a fresh reading reaches the rearm threshold. Watch state and a bounded event log persist locally.
 - Reorder, hide, restore, focus, and maximize tiles. Drag the one-cell split dividers or adjust them from the keyboard. Small terminals switch to a focused-tile view.
 - A command palette exposes application actions to both keyboard and pointer users. Clickable tabs, tile controls, sensor rows, modal actions, SGR mouse support, and local wheel scrolling are available in Windows Terminal.
 - Declarative semantic themes, including Cyberwave and Corrosion, deterministic colour-depth fallback, ASCII mode, monochrome mode, and a LUTEXskin-inspired 256-entry palette composer with anchor stops, sRGB/linear interpolation, cyclic palettes, exact hex editing, and seeded variation. The theme LUT colours metric bars and recent-history charts.
@@ -66,6 +66,8 @@ py -3 -m compileall -q src tests
 
 To smoke-check the interactive screen without HWiNFO, run `py -3 -m hwinfo_term --demo` and press `Q` to quit.
 
+The [Quality workflow](.github/workflows/quality.yml) installs the package and runs the suite on Windows and Linux with Python 3.11 and 3.14. Five Windows-only integration tests use isolated, real named mappings and mutexes to exercise the reader's Win32 API path. They do not require HWiNFO and do not establish live-provider compatibility. See the [quality audit and acceptance notes](docs/quality-audit-2026-11-04.md) for the repaired defects and remaining native acceptance checks.
+
 ## Controls
 
 | Key | Action |
@@ -86,7 +88,7 @@ To smoke-check the interactive screen without HWiNFO, run `py -3 -m hwinfo_term 
 | `A` | Show or hide 1-minute and 5-minute averages in history chart readouts |
 | Mouse on Cards | Click a card to assign a sensor with autocomplete; drag to reorder; double-right-click to remove |
 | `T`, `E` | Select the next theme, edit the palette |
-| `Q` | Quit and restore the terminal |
+| `Q` | Quit and restore the terminal (`Ctrl+C` also exits from dialogs and palette editing) |
 
 On the dashboard, double-click a sensor row to add it to Live Metrics, double-click a metric row to add it to Recent History, and double-right-click a row in either tile to remove it. Tile maximize and close controls always act on the tile they are drawn on. Recent History charts rescale their LUT mapping to the values currently visible in each chart. On the Recent tab, drag the chart/readout divider to set the plot width per metric; drag the bottom-right corner to change its chart height, or a column gutter to resize all cards in that column. Cards starts as a copy of Recent and can then be independently assigned and reordered; its settings persist with the local configuration.
 
@@ -94,9 +96,13 @@ The palette editor uses arrow keys to select and adjust stops, `A` to add a stop
 
 ## Local state
 
-Configuration, tile layout, pinned or excluded metrics, Recent History entries and groups, Cards assignments and layout, header visibility, per-metric chart/readout widths, chart heights and styles, the in-bar label option, watches, and events live in `%LOCALAPPDATA%\HWiNFOterm\config.json`. A previous configuration is copied to `config.json.bak` before writes. Use `--state-dir` to select a different directory.
+Configuration, tile layout, pinned or excluded metrics, Recent History entries and groups, Cards assignments and layout, header visibility, per-metric chart/readout widths, chart heights and styles, the in-bar label option, watches, and events live in `%LOCALAPPDATA%\HWiNFOterm\config.json`. A previous valid configuration is copied to `config.json.bak` before writes. If the primary file is missing or unreadable, a usable backup is recovered with a visible warning; a damaged primary does not overwrite that backup. Use `--state-dir` to select a different directory.
 
-The reader opens `Global\HWiNFO_SENS_SM2` with read permission and coordinates access with `Global\HWiNFO_SM2_MUTEX`. It validates the signature, version, section ranges, element sizes, counts, and mapping bounds before reading. It accepts SM2 version 2, identifies packed versus four-byte-aligned reading values from the descriptors and sampled numbers, and reads the extended UTF-8 labels when present. It reports unsupported or ambiguous layouts instead of guessing. Sensor and reading labels are rendered as plain text; terminal control characters are stripped.
+By default, `--demo` stores its settings under `%LOCALAPPDATA%\HWiNFOterm\demo` so synthetic sensor assignments cannot populate the live dashboard's configuration. An explicit `--state-dir` is used exactly as supplied, including in demo mode. History is held in memory and is limited by both `--history-seconds` and 1,800 samples per sensor; the time setting is an age ceiling, not a guaranteed retained duration.
+
+The reader opens `Global\HWiNFO_SENS_SM2` with read permission and coordinates access with `Global\HWiNFO_SM2_MUTEX`. It validates the signature, version, section ranges, element sizes, counts, and mapping bounds before reading. It accepts SM2 version 2 and explicitly supported reading strides of 316, 320, 460, and 464 bytes, including the known extended UTF-8 labels. Numeric values never override the declared layout; nonfinite readings stay unavailable, and unknown strides or duplicate reading identities are rejected. The mutex protects the coherent memory copy and is released before Python parsing. Sensor and reading labels are rendered as plain text; terminal control characters are stripped in both the TUI and plain CLI output. JSON snapshots preserve Unicode labels using escaped JSON strings for reliable redirection on Windows.
+
+Unavailable and stale sources remain explicit until a successful fresh read. Cached values display as `OFFLINE` or `STALE` in current-value fields, including with the header hidden or monochrome rendering; retained charts remain historical data. A reading removed from a new provider snapshot becomes missing immediately.
 
 HWiNFO may deactivate Shared Memory Support after a time limit depending on its license. HWiNFOterm reports the resulting stale or unavailable state and does not alter HWiNFO settings or try to bypass that limit. See [HWiNFO's license comparison](https://www.hwinfo.com/licenses/).
 

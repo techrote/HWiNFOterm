@@ -167,6 +167,7 @@ class TUIApp:
         self.focused_tile = config.get("focused_tile", "metrics")
         self.tile_scroll = {tile: 0 for tile in TILES}
         self.tile_scroll["cards"] = 0
+        self._selection_scroll_pending: set[str] = set()
         self.tile_order = [tile for tile in config.get("tile_order", TILES) if tile in TILES]
         for tile in TILES:
             if tile not in self.tile_order:
@@ -177,7 +178,7 @@ class TUIApp:
         self.row_ratio = float(config.get("row_ratio", 0.54))
         self.selected_sensor = config.get("selected_sensor")
         self.selected_sensor_index = 0
-        self.filter_text = ""
+        self.filter_text = config.get("filter_text", "")
         self.last_click: tuple[float, str, Any] | None = None
         self.last_right_click: tuple[float, str, str] | None = None
         self.group_metric_index = 0
@@ -210,6 +211,13 @@ class TUIApp:
         self.status_message = config_error or warning
         self.status_deadline = time.monotonic() + (8.0 if self.status_message else 0.0)
         self._sample_count = 0
+        self._source_interruption_count = 0
+        # Pending durations are process-local and measured on a monotonic clock.
+        # A saved timestamp cannot establish uninterrupted observations at startup.
+        self._watch_pending: dict[int, tuple[float, float]] = {}
+        for watch in self.config.get("watches", []):
+            if not watch.get("active"):
+                watch["since"] = None
         self._source_mode = "demo" if demo else "hwinfo"
 
     def _save(self) -> None:
@@ -735,6 +743,7 @@ class TUIApp:
         watches = self.config.get("watches", [])
         if 0 <= self.watch_delete_index < len(watches):
             removed = watches.pop(self.watch_delete_index)
+            self._watch_pending.pop(id(removed), None)
             self.watch_index = max(0, min(self.watch_delete_index, len(watches) - 1))
             self._save()
             self._message(f"Removed watch: {removed.get('label', removed.get('id', 'watch'))}")
@@ -869,33 +878,57 @@ class TUIApp:
 
     def _check_watches(self, records: dict[str, SensorRecord], status: SourceStatus) -> None:
         sample_count = status.sample_count
-        if sample_count == self._sample_count:
-            return
+        new_sample = sample_count != self._sample_count
+        interrupted = status.interruption_count != self._source_interruption_count
+        skipped_samples = sample_count > self._sample_count + 1
         self._sample_count = sample_count
+        self._source_interruption_count = status.interruption_count
         now = time.time()
+        clock = time.monotonic()
         changed = False
         for watch in self.config.get("watches", []):
+            watch_id = id(watch)
             record = records.get(watch.get("sensor"))
-            if record is None or self.store.quality(record, now) != "good" or record.value is None:
+            if interrupted or skipped_samples:
+                # A recovered failure or an unobserved provider sample may have
+                # broken continuity even if this frame contains a good value.
+                self._watch_pending.pop(watch_id, None)
+                if not watch.get("active") and watch.get("since") is not None:
+                    watch["since"] = None
+                    changed = True
+            if status.state not in {"connected", "demo"} or record is None or self.store.quality(record, now) != "good" or record.value is None:
+                self._watch_pending.pop(watch_id, None)
                 if watch.get("since") is not None and not watch.get("active"):
                     watch["since"] = None
                     changed = True
                 continue
+            if not new_sample:
+                continue
             value = record.value
-            if value >= float(watch["above"]):
-                if watch.get("since") is None:
-                    watch["since"] = now
-                    changed = True
-                duration = max(0.0, float(watch.get("duration", 0)))
-                if not watch.get("active") and now - float(watch["since"]) >= duration:
-                    watch["active"] = True
-                    changed = True
-                    self._add_event(watch, "triggered", value)
-            elif value <= float(watch["below"]):
-                if watch.get("active"):
+            if watch.get("active"):
+                if value <= float(watch["below"]) and value < float(watch["above"]):
                     self._add_event(watch, "cleared", value)
                     watch["active"] = False
+                    watch["since"] = None
                     changed = True
+                self._watch_pending.pop(watch_id, None)
+            elif value >= float(watch["above"]):
+                pending = self._watch_pending.get(watch_id)
+                if pending is None or not 0 <= record.observed_at - pending[1] < self.store.stale_after:
+                    watch["since"] = now
+                    pending = (clock, record.observed_at)
+                    changed = True
+                self._watch_pending[watch_id] = (pending[0], record.observed_at)
+                duration = max(0.0, float(watch.get("duration", 0)))
+                if clock - pending[0] >= duration:
+                    watch["active"] = True
+                    self._watch_pending.pop(watch_id, None)
+                    changed = True
+                    self._add_event(watch, "triggered", value)
+            else:
+                # Hysteresis applies to an active watch. A pending trigger needs
+                # every observed value to continue satisfying the trigger bound.
+                self._watch_pending.pop(watch_id, None)
                 if watch.get("since") is not None:
                     watch["since"] = None
                     changed = True
@@ -944,6 +977,9 @@ class TUIApp:
         self.drag = None
 
     def _handle_event(self, event: Event) -> None:
+        if event.kind == "eof":
+            self.quit_requested = True
+            return
         if event.kind == "focus" and event.action == "out":
             if self.drag:
                 self._cancel_drag()
@@ -1031,6 +1067,9 @@ class TUIApp:
             self._dispatch_by_key(value.lower())
 
     def _handle_key(self, key: str, event: Event) -> None:
+        if key in {"ctrl+c", "ctrl+d"}:
+            self.quit_requested = True
+            return
         if key == "f2":
             self._dispatch("ui.toggle_chrome")
             return
@@ -1249,8 +1288,9 @@ class TUIApp:
     def _move_selection(self, delta: int) -> None:
         records, _ = self.store.snapshot()
         ordered = self._ordered_records(records)
-        if self.view == "alerts" and self.config.get("watches"):
+        if (self.view == "alerts" or (self.view == "dashboard" and self.focused_tile == "alerts")) and self.config.get("watches"):
             self.watch_index = min(max(0, self.watch_index + delta), len(self.config["watches"]) - 1)
+            self._selection_scroll_pending.add("alerts")
         elif ordered:
             if self.selected_sensor not in [record.reading.key for record in ordered]:
                 self.selected_sensor_index = 0
@@ -1258,7 +1298,9 @@ class TUIApp:
                 self.selected_sensor_index = [record.reading.key for record in ordered].index(self.selected_sensor)
             self.selected_sensor_index = min(max(0, self.selected_sensor_index + delta), len(ordered) - 1)
             self.selected_sensor = ordered[self.selected_sensor_index].reading.key
-            self._tile_focus("sensors" if self.view == "sensors" else "history")
+            target = "sensors" if self.view == "sensors" or (self.view == "dashboard" and self.focused_tile == "sensors") else "history"
+            self._tile_focus(target)
+            self._selection_scroll_pending.add("sensors")
 
     def _move_recent_selection(self, delta: int) -> None:
         keys = self._active_history_keys()
@@ -1279,6 +1321,20 @@ class TUIApp:
         target = tile or (self.focused_tile if self.view == "dashboard" else self.view)
         amount = 6 if page else 3
         self.tile_scroll[target] = max(0, self.tile_scroll.get(target, 0) + delta * amount)
+        self._selection_scroll_pending.discard(target)
+
+    def _list_offset(self, target: str, total: int, capacity: int, selected: int | None = None) -> int:
+        capacity = max(1, capacity)
+        offset = min(max(0, total - capacity), max(0, self.tile_scroll.get(target, 0)))
+        if target in self._selection_scroll_pending:
+            self._selection_scroll_pending.discard(target)
+            if selected is not None:
+                if selected < offset:
+                    offset = max(0, selected)
+                elif selected >= offset + capacity:
+                    offset = min(max(0, total - capacity), selected - capacity + 1)
+        self.tile_scroll[target] = offset
+        return offset
 
     def _handle_mouse(self, event: Event) -> None:
         if event.action == "move" and self.drag:
@@ -1945,6 +2001,14 @@ class TUIApp:
             body = f"{value:.1f}"
         return f"{body} {unit}".rstrip()
 
+    def _current_value(self, record: SensorRecord) -> str:
+        quality = self.store.quality(record)
+        if quality == "good":
+            return self._format_value(record.value, record.reading.unit)
+        # This remains visible when the source/status header is hidden or when
+        # monochrome rendering cannot distinguish a warning colour.
+        return {"stale": "STALE", "unavailable": "OFFLINE"}.get(quality, "—")
+
     def _value_role(self, record: SensorRecord, now: float | None = None) -> str:
         if self.store.quality(record, now) != "good":
             return "status.warning"
@@ -1973,12 +2037,12 @@ class TUIApp:
         count = min(len(featured), max(1, height // row_height))
         for index, record in enumerate(featured[:count]):
             row_y = y + index * row_height
-            value = self._format_value(record.value, record.reading.unit)
+            value = self._current_value(record)
             role = self._value_role(record, now)
             self._register(x, row_y, width, row_height, "metric_select", record.reading.key)
             if labels_in_bar:
                 bar_width = width
-                fraction = max(0.0, min(1.0, (record.value or 0.0) / 100.0))
+                fraction = max(0.0, min(1.0, (record.value or 0.0) / 100.0)) if self.store.quality(record, now) == "good" else 0.0
                 completed = min(bar_width, round(fraction * bar_width))
                 self._draw_metric_bar(canvas, x, row_y, bar_width, completed)
                 value_cells = min(bar_width, sum(cell_width(char) for char in value))
@@ -1996,7 +2060,7 @@ class TUIApp:
             canvas.put(x, row_y, name, "text.primary", "surface.tile", max_width=label_width)
             canvas.put(x + label_width + 1, row_y, value, role, "surface.tile", True, max_width=value_width)
             if row_height == 2:
-                fraction = max(0.0, min(1.0, (record.value or 0.0) / 100.0))
+                fraction = max(0.0, min(1.0, (record.value or 0.0) / 100.0)) if self.store.quality(record, now) == "good" else 0.0
                 bar_width = max(1, width - 2)
                 completed = min(bar_width, round(fraction * bar_width))
                 self._draw_metric_bar(canvas, x, row_y + 1, bar_width, completed)
@@ -2061,7 +2125,9 @@ class TUIApp:
             start = y + 2
             canvas.put(x, y + 1, "PIN  READING".ljust(max(12, int(width * .48))) + "SENSOR".ljust(max(8, int(width * .23))) + "VALUE / UNIT       STATE", "accent.secondary", "surface.base", True, max_width=width)
             count = max(0, height - 2)
-        offset = self.tile_scroll["sensors"]
+        count = min(count, max(0, canvas.height - 2 - start))
+        selected_index = next((index for index, record in enumerate(ordered) if record.reading.key == self.selected_sensor), None)
+        offset = self._list_offset("sensors", len(ordered), count, selected_index)
         available = ordered[offset : offset + count]
         for row_index, record in enumerate(available):
             row_y = start + row_index
@@ -2075,7 +2141,7 @@ class TUIApp:
                 marker = "*" if record.reading.key in pinned else "."
             label_w = max(12, int(width * 0.43)) if width > 40 else max(6, int(width * 0.45))
             sensor_w = max(6, int(width * 0.22)) if width > 40 else max(3, int(width * 0.15))
-            value_text = self._format_value(record.value, record.reading.unit)
+            value_text = self._current_value(record)
             state = self.store.quality(record)
             prefix = f"{marker} "
             row_fg, row_bg, row_bold, _ = self._style("content", "sensor-row", "default", "text.primary", "surface.tile" if mini else "surface.base")
@@ -2448,7 +2514,7 @@ class TUIApp:
                         break
                     item_height = remaining
                     chart_rows = max(0, item_height - 1)
-                current = self._format_value(record.value, record.reading.unit)
+                current = self._current_value(record)
                 current_width = min(chart_width, sum(cell_width(char) for char in current))
                 label_width = max(0, chart_width - current_width - (1 if current_width < chart_width else 0))
                 canvas.put(x, row_y, record.reading.label, "text.primary", "surface.tile", max_width=label_width)
@@ -2493,7 +2559,7 @@ class TUIApp:
         values = self._history_values(record.reading.key)
         nums = [value for _, value in values]
         canvas.put(x, y, f"{record.reading.sensor}  /  {record.reading.label}", "accent.primary", "surface.base", True, max_width=width)
-        canvas.put(x, y + 1, f"Current  {self._format_value(record.value, record.reading.unit)}   ·   State  {self.store.quality(record).upper()}", self._value_role(record), "surface.base", True, max_width=width)
+        canvas.put(x, y + 1, f"Current  {self._current_value(record)}   ·   State  {self.store.quality(record).upper()}", self._value_role(record), "surface.base", True, max_width=width)
         if not nums:
             canvas.put(x, y + 3, "Waiting for samples…", "text.secondary", "surface.base", max_width=width)
             return
@@ -2560,8 +2626,11 @@ class TUIApp:
             if height > 1:
                 canvas.put(x, y + 1, "Select a sensor and press W to add one", "text.disabled", "surface.tile", max_width=width)
         rows_for_watches = min(len(watches), max(0, height - (1 if mini else 3)))
-        for index, watch in enumerate(watches[:rows_for_watches]):
-            row_y = y + index
+        rows_for_watches = min(rows_for_watches, max(0, canvas.height - 2 - y))
+        offset = self._list_offset("alerts", len(watches), rows_for_watches, self.watch_index)
+        for row_index, watch in enumerate(watches[offset : offset + rows_for_watches]):
+            index = offset + row_index
+            row_y = y + row_index
             if row_y >= canvas.height - 2:
                 break
             record = records.get(watch.get("sensor"))
@@ -2570,10 +2639,13 @@ class TUIApp:
             state = "ACTIVE" if active else "ARMED"
             if not active and watch.get("since") is not None:
                 state = "PENDING"
+            available = record is not None and self.store.quality(record) == "good"
+            if not available:
+                state = "ACTIVE?" if active else "NO DATA"
             text = f"{state:7} {watch.get('label', 'sensor')} ≥ {watch.get('above', '?')} / reset ≤ {watch.get('below', '?')}"
             if current is not None:
-                text += f"  {self._format_value(current, record.reading.unit)}"
-            role = "status.error" if active else "status.warning" if state == "PENDING" else "status.success"
+                text += f"  {self._current_value(record)}"
+            role = "status.error" if active else "status.warning" if state in {"PENDING", "NO DATA"} else "status.success"
             background = "state.selected" if index == self.watch_index and self.view == "alerts" else "surface.tile" if mini else "surface.base"
             canvas.put(x, row_y, text, role, background, active, max_width=width)
             self._register(x, row_y, width, 1, "watch_select", index)
@@ -2837,7 +2909,7 @@ class TUIApp:
     ) -> None:
         border = "accent.primary" if selected else "border.normal"
         canvas.rect(x, y, width, height, border, "surface.tile")
-        value = self._format_value(record.value, record.reading.unit)
+        value = self._current_value(record)
         value_width = min(max(0, width - 4), sum(cell_width(char) for char in value))
         label_width = max(0, width - value_width - 5)
         canvas.put(x + 2, y + 1, record.reading.label, "text.primary", "surface.tile", selected, max_width=label_width)
@@ -3212,7 +3284,7 @@ class TUIApp:
         for index, key in enumerate(visible_keys):
             record = records.get(key)
             label = record.reading.label if record else key
-            value = f"  {self._format_value(record.value, record.reading.unit)}" if record else "  (not connected)"
+            value = f"  {self._current_value(record)}" if record else "  (not connected)"
             checked = key in members
             marker = "✓" if checked else "□"
             if self.ascii_only:

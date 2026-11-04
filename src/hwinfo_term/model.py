@@ -29,6 +29,7 @@ class SourceStatus:
     last_change: float | None = None
     poll_time: int | None = None
     sample_count: int = 0
+    interruption_count: int = 0
 
 
 class TelemetryStore:
@@ -38,19 +39,27 @@ class TelemetryStore:
         self.history_seconds = history_seconds
         self.stale_after = stale_after
         self.status = SourceStatus()
-        self._last_content: tuple[tuple[str, float | None], ...] | None = None
+        self._last_content: tuple[tuple[str, Reading], ...] | None = None
+        self._source_error: str | None = None
 
     def ingest(self, snapshot: Snapshot, observed_at: float | None = None) -> bool:
         now = observed_at if observed_at is not None else time.time()
-        content = tuple(sorted((key, reading.value) for key, reading in snapshot.readings.items()))
+        content = tuple(sorted(snapshot.readings.items()))
         with self.lock:
             changed = self.status.poll_time != snapshot.poll_time or content != self._last_content
             self.status.last_read = now
+            self._source_error = None
             if changed:
                 self.status.last_change = now
                 self.status.poll_time = snapshot.poll_time
                 self.status.sample_count += 1
                 self._last_content = content
+                for key in self.records.keys() - snapshot.readings.keys():
+                    # Keep metadata/history for pinned cards, but never treat a
+                    # removed sensor's last reading as a fresh measurement.
+                    record = self.records[key]
+                    record.value = None
+                    record.reading = replace(record.reading, value=None, minimum=None, maximum=None, average=None)
                 for key, reading in snapshot.readings.items():
                     record = self.records.get(key)
                     if record is None:
@@ -67,24 +76,25 @@ class TelemetryStore:
                         record.history.popleft()
                 self.status.state = "connected"
                 self.status.message = "HWiNFO shared memory is updating"
-                self.status.since = self.status.since or now
+                if self.status.since is None:
+                    self.status.since = now
             self._refresh_stale_locked(now)
         return changed
 
     def source_error(self, message: str, now: float | None = None) -> None:
-        at = now if now is not None else time.time()
+        del now  # Failures do not advance the last successful read timestamp.
         with self.lock:
-            self.status.last_read = at
-            if self.status.last_change is None:
-                self.status.state = "unavailable"
-                self.status.message = message
-            else:
-                self._refresh_stale_locked(at)
-                if self.status.state != "stale":
-                    self.status.state = "unavailable"
-                    self.status.message = message
+            # Preserve a missed outage even if recovery occurs between UI frames.
+            self.status.interruption_count += 1
+            self._source_error = message
+            self.status.state = "unavailable"
+            self.status.message = message
 
     def _refresh_stale_locked(self, now: float) -> None:
+        if self._source_error is not None:
+            self.status.state = "unavailable"
+            self.status.message = self._source_error
+            return
         if self.status.last_change is None:
             return
         age = now - self.status.last_change
@@ -97,11 +107,14 @@ class TelemetryStore:
 
     def quality(self, record: SensorRecord, now: float | None = None) -> str:
         current = now if now is not None else time.time()
-        if record.value is None:
-            return "missing"
-        if current - record.observed_at >= self.stale_after:
-            return "stale"
-        return "good"
+        with self.lock:
+            if record.value is None:
+                return "missing"
+            if self._source_error is not None:
+                return "unavailable"
+            if current - record.observed_at >= self.stale_after:
+                return "stale"
+            return "good"
 
     def snapshot(self) -> tuple[dict[str, SensorRecord], SourceStatus]:
         now = time.time()

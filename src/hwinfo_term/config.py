@@ -70,6 +70,8 @@ def _bounded_ratio(value: Any, fallback: float) -> float:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return fallback
+    if not math.isfinite(number):
+        return fallback
     return min(0.78, max(0.22, number))
 
 
@@ -80,7 +82,7 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
     error = None
 
     if raw.get("version") != 1:
-        error = "Unrecognised config version; defaults are active until saved"
+        error = "Unrecognised config version; only recognised settings were recovered"
     for key in ("poll_interval", "stale_after", "history_seconds"):
         try:
             value = float(raw.get(key, cfg[key]))
@@ -186,13 +188,16 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
     active_group = raw.get("active_history_group", "All")
     if isinstance(active_group, str) and (active_group == "All" or any(group["name"] == active_group for group in cfg["history_groups"])):
         cfg["active_history_group"] = active_group
-    if raw.get("colour_mode") in {"auto", "truecolor", "256", "16", "mono"}:
-        cfg["colour_mode"] = raw["colour_mode"]
+    colour_mode = raw.get("colour_mode")
+    if isinstance(colour_mode, str) and colour_mode in {"auto", "truecolor", "256", "16", "mono"}:
+        cfg["colour_mode"] = colour_mode
+    elif "colour_mode" in raw:
+        error = error or "Invalid colour_mode; its default is active"
 
     order = raw.get("tile_order")
     if isinstance(order, list):
         cfg["tile_order"] = list(dict.fromkeys([x for x in order if x in TILES] + TILES))[: len(TILES)]
-    hidden = [x for x in cfg["hidden_tiles"] if x in TILES]
+    hidden = list(dict.fromkeys(x for x in cfg["hidden_tiles"] if x in TILES))
     cfg["hidden_tiles"] = hidden
     if len(hidden) == len(TILES):
         cfg["hidden_tiles"].remove("metrics")
@@ -205,7 +210,13 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
     if isinstance(raw.get("theme"), str) and len(raw["theme"]) <= 64:
         cfg["theme"] = raw["theme"]
     if isinstance(raw.get("theme_document"), dict):
-        cfg["theme_document"] = raw["theme_document"]
+        try:
+            # JSON accepts NaN/Infinity by default; retaining them in an opaque
+            # theme document would prevent every later settings save.
+            json.dumps(raw["theme_document"], allow_nan=False)
+            cfg["theme_document"] = deepcopy(raw["theme_document"])
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            error = error or "Invalid theme_document; the default theme is active"
     if isinstance(raw.get("selected_sensor"), str) and len(raw["selected_sensor"]) <= 64:
         cfg["selected_sensor"] = raw["selected_sensor"]
     if isinstance(raw.get("filter_text"), str):
@@ -216,8 +227,10 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
         pass
 
     cfg["pinned"] = list(dict.fromkeys(k for k in cfg["pinned"] if isinstance(k, str) and len(k) <= 64))
-    for key in ("excluded_metrics", "history_keys", "cards_keys"):
+    for key in ("excluded_metrics", "history_keys"):
         cfg[key] = list(dict.fromkeys(k for k in cfg[key] if isinstance(k, str) and len(k) <= 64))
+    # Cards are ordered slots: multiple cards may deliberately show one sensor.
+    cfg["cards_keys"] = [k for k in cfg["cards_keys"] if isinstance(k, str) and k and len(k) <= 64][:256]
     raw_chart_rows = raw.get("history_chart_rows", {})
     if isinstance(raw_chart_rows, dict):
         chart_rows = {}
@@ -248,14 +261,17 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
         if not isinstance(row, dict):
             continue
         try:
+            duration = float(row.get("duration", 0))
+            if not math.isfinite(duration):
+                continue
             item = {
                 "id": str(row["id"])[:64],
                 "sensor": str(row["sensor"])[:64],
                 "label": str(row.get("label", row["sensor"]))[:128],
                 "above": float(row["above"]),
                 "below": float(row["below"]),
-                "duration": min(3600.0, max(0.0, float(row.get("duration", 0)))),
-                "active": bool(row.get("active", False)),
+                "duration": min(3600.0, max(0.0, duration)),
+                "active": row.get("active") is True,
                 "since": None,
             }
             if all(math.isfinite(item[key]) for key in ("above", "below", "duration")) and item["above"] >= item["below"]:
@@ -288,34 +304,64 @@ def normalize(raw: Any) -> tuple[dict[str, Any], str | None]:
 
 def load_config(state_dir: Path) -> tuple[dict[str, Any], str | None]:
     path = config_path(state_dir)
-    if not path.exists():
-        return deepcopy(DEFAULT_CONFIG), None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return deepcopy(DEFAULT_CONFIG), f"Could not read {path.name}: {exc}"
-    return normalize(raw)
+        if not isinstance(raw, dict):
+            raise ValueError("configuration root must be a JSON object")
+        return normalize(raw)
+    except FileNotFoundError:
+        primary_error = None
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        primary_error = f"Could not read {path.name}: {exc}"
 
-
-def save_config(state_dir: Path, config: dict[str, Any]) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    path = config_path(state_dir)
-    document = json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-    fd, temporary = tempfile.mkstemp(prefix="config-", suffix=".tmp", dir=state_dir)
+    # Read-only recovery: leave the damaged primary and last good backup intact
+    # until the user next changes settings or quits normally.
+    backup = path.with_suffix(".json.bak")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+        raw = json.loads(backup.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("configuration root must be a JSON object")
+        cfg, warning = normalize(raw)
+    except FileNotFoundError:
+        return deepcopy(DEFAULT_CONFIG), primary_error
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        warning = f"Could not read backup {backup.name}: {exc}"
+        return deepcopy(DEFAULT_CONFIG), f"{primary_error}; {warning}" if primary_error else warning
+    message = f"Recovered configuration from backup {backup.name}"
+    if warning:
+        message += f"; {warning}"
+    return cfg, message
+
+
+def _replace_bytes(path: Path, document: bytes) -> None:
+    """Atomically replace a settings file after flushing its complete contents."""
+    fd, temporary = tempfile.mkstemp(prefix="config-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
             stream.write(document)
             stream.flush()
             os.fsync(stream.fileno())
-        if path.exists():
-            backup = path.with_suffix(".json.bak")
-            try:
-                backup.write_bytes(path.read_bytes())
-            except OSError:
-                pass
         os.replace(temporary, path)
     finally:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def save_config(state_dir: Path, config: dict[str, Any]) -> None:
+    document = json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = config_path(state_dir)
+    try:
+        previous = path.read_bytes()
+        raw = json.loads(previous.decode("utf-8"))
+        _, warning = normalize(raw)
+        # Never replace a recoverable backup with a corrupt primary. Validate
+        # opaque/unknown fields as well, without discarding them from the copy.
+        json.dumps(raw, allow_nan=False)
+        if warning is None:
+            _replace_bytes(path.with_suffix(".json.bak"), previous)
+    except (OSError, UnicodeError, TypeError, ValueError, RecursionError):
+        pass
+    _replace_bytes(path, document.encode("utf-8"))

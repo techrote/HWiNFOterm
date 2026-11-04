@@ -8,6 +8,7 @@ import os
 import random
 import re
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 
 
@@ -329,7 +330,9 @@ class Theme:
         self.palette = self._validate_palette(self.definition.get("palette", {}))
         self.lut = sample_palette(self.palette)
         roles = deepcopy(ROLE_DEFAULTS)
-        for role, value in self.definition.get("semantic_roles", {}).items():
+        if not isinstance(self.definition.get("semantic_roles"), dict):
+            self.definition["semantic_roles"] = {}
+        for role, value in self.definition["semantic_roles"].items():
             if role in roles and isinstance(value, str) and HEX.fullmatch(value):
                 roles[role] = value.lower()
         if "semantic_roles" not in self.definition or not isinstance(self.definition["semantic_roles"], dict):
@@ -349,7 +352,8 @@ class Theme:
         if not isinstance(raw, dict):
             return fallback
         palette = deepcopy(fallback)
-        palette["interpolation"] = raw.get("interpolation") if raw.get("interpolation") in {"srgb", "linear"} else fallback["interpolation"]
+        interpolation = raw.get("interpolation")
+        palette["interpolation"] = interpolation if isinstance(interpolation, str) and interpolation in {"srgb", "linear"} else fallback["interpolation"]
         palette["cyclic"] = raw.get("cyclic") if isinstance(raw.get("cyclic"), bool) else fallback["cyclic"]
         try:
             palette["seed"] = int(raw.get("seed", fallback["seed"]))
@@ -456,11 +460,13 @@ def _xterm_rgb(index: int) -> tuple[int, int, int]:
     return levels[index // 36], levels[(index // 6) % 6], levels[index % 6]
 
 
+@lru_cache(maxsize=4096)
 def _xterm_index(red: int, green: int, blue: int) -> int:
     # Deterministic nearest-colour search across the canonical xterm 256 palette.
     return min(range(256), key=lambda i: sum((a - b) ** 2 for a, b in zip((red, green, blue), _xterm_rgb(i))))
 
 
+@lru_cache(maxsize=4096)
 def _ansi16_index(red: int, green: int, blue: int) -> int:
     return min(range(16), key=lambda i: sum((a - b) ** 2 for a, b in zip((red, green, blue), _xterm_rgb(i))))
 
