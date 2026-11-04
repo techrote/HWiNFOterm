@@ -17,7 +17,6 @@ HEADER_SIZE = HEADER_PACKED.size
 HEADER_MAX_SIZE = max(HEADER_PACKED.size, HEADER_ALIGNED.size)
 READING_PACKED = struct.Struct("<III128s128s16sdddd")
 READING_ALIGNED = struct.Struct("<III128s128s16s4xdddd")
-READING_FORMATS = (READING_PACKED, READING_ALIGNED)
 MAX_MAPPING_BYTES = 64 * 1024 * 1024
 MAX_SENSOR_COUNT = 10_000
 MAX_READING_COUNT = 100_000
@@ -113,55 +112,29 @@ def _layout(data: bytes) -> tuple[int, int, int, int, int, int, int, int]:
     return best_candidates[0][2]
 
 
-def _plausible_sample(value: float) -> bool:
-    return math.isfinite(value) and (value == 0.0 or 1e-150 <= abs(value) <= 1e150)
-
-
-def _reading_format(data: bytes, offset: int, stride: int, count: int) -> struct.Struct:
-    """Choose the known numeric prefix using row size and real-value evidence."""
-    formats = [candidate for candidate in READING_FORMATS if candidate.size <= stride]
-    if not formats:
-        raise SharedMemoryError("HWiNFO reading rows are smaller than any supported layout")
-    if count == 0:
-        return READING_ALIGNED if stride in {READING_ALIGNED.size, READING_ALIGNED.size + 144} else READING_PACKED
-    scores = []
-    sample_count = min(count, 64)
-    for candidate in formats:
-        offset_values = candidate.size - 4 * 8
-        plausible = nonzero = 0
-        for index in range(sample_count):
-            base = offset + index * stride + offset_values
-            for value_index in range(4):
-                value = struct.unpack_from("<d", data, base + value_index * 8)[0]
-                if _plausible_sample(value):
-                    plausible += 1
-                    nonzero += value != 0.0
-        scores.append((candidate, plausible, nonzero))
-
-    expected_size = {
-        READING_PACKED.size: READING_PACKED.size,
-        READING_ALIGNED.size: READING_ALIGNED.size,
-        READING_PACKED.size + 144: READING_PACKED.size,
-        READING_ALIGNED.size + 144: READING_ALIGNED.size,
-    }.get(stride)
-    best_score = max((nonzero, plausible) for _, plausible, nonzero in scores)
-    best = [candidate for candidate, plausible, nonzero in scores if (nonzero, plausible) == best_score]
-    if expected_size is not None:
-        expected = next((candidate for candidate in best if candidate.size == expected_size), None)
-        if expected is not None:
-            return expected
-    if len(best) == 1:
-        return best[0]
-    raise SharedMemoryError("HWiNFO reading layout could not be identified safely")
+def _reading_format(stride: int) -> struct.Struct:
+    """Select only known row descriptors; sensor values are not layout evidence."""
+    known_formats = {
+        READING_PACKED.size: READING_PACKED,
+        READING_ALIGNED.size: READING_ALIGNED,
+        READING_PACKED.size + 144: READING_PACKED,
+        READING_ALIGNED.size + 144: READING_ALIGNED,
+    }
+    try:
+        return known_formats[stride]
+    except KeyError:
+        raise SharedMemoryError(
+            f"Unsupported HWiNFO reading row size {stride}; expected 316, 320, 460, or 464 bytes"
+        ) from None
 
 
 def parse_mapping(data: bytes) -> Snapshot:
-    """Parse one copied SM2 mapping. Extra fields in future strides are ignored."""
+    """Parse one copied SM2 mapping using the supported reading row descriptors."""
     poll_time, sensor_offset, sensor_size, sensor_count, reading_offset, reading_size, reading_count, required_size = _layout(data)
     if len(data) < required_size:
         raise SharedMemoryError("HWiNFO shared-memory sections are incomplete")
 
-    reading_format = _reading_format(data, reading_offset, reading_size, reading_count)
+    reading_format = _reading_format(reading_size)
     sensors: list[tuple[int, int, str]] = []
     for index in range(sensor_count):
         base = sensor_offset + index * sensor_size
@@ -178,6 +151,8 @@ def parse_mapping(data: bytes) -> Snapshot:
             raise SharedMemoryError("HWiNFO reading refers to an unknown sensor")
         sensor_id, instance, sensor_name = sensors[sensor_index]
         key = f"{sensor_id:08x}:{instance}:{reading_id:08x}"
+        if key in readings:
+            raise SharedMemoryError(f"HWiNFO reported a duplicate reading identity: {key}")
         utf8_prefix = {460: READING_PACKED.size, 464: READING_ALIGNED.size}.get(reading_size)
         has_utf8_fields = utf8_prefix == reading_format.size
         label = _text(data, base + reading_format.size, 128, "utf-8") if has_utf8_fields else ""
@@ -234,6 +209,8 @@ def read_snapshot(timeout_ms: int = 300) -> Snapshot:
     acquired = False
     try:
         wait_result = kernel.WaitForSingleObject(mutex, max(0, min(timeout_ms, 5000)))
+        if wait_result == 0xFFFFFFFF:  # WAIT_FAILED
+            raise SharedMemoryError(f"HWiNFO mutex wait failed (Windows error {ctypes.get_last_error()})")
         if wait_result not in (0x00000000, 0x00000080):  # WAIT_OBJECT_0 / WAIT_ABANDONED
             raise SharedMemoryError("Timed out waiting for a consistent HWiNFO snapshot")
         acquired = True
@@ -258,7 +235,6 @@ def read_snapshot(timeout_ms: int = 300) -> Snapshot:
         if not view:
             raise SharedMemoryError("Could not map HWiNFO sensor readings")
         copied = ctypes.string_at(view, required_size)
-        return parse_mapping(copied)
     except OSError as exc:
         raise SharedMemoryError(f"Windows shared-memory call failed: {exc}") from exc
     finally:
@@ -269,3 +245,7 @@ def read_snapshot(timeout_ms: int = 300) -> Snapshot:
         if acquired:
             kernel.ReleaseMutex(mutex)
         kernel.CloseHandle(mutex)
+
+    # The private byte copy is stable. Do not hold the provider's mutex while
+    # decoding labels and building Python objects for a large sensor catalogue.
+    return parse_mapping(copied)

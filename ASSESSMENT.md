@@ -2,6 +2,8 @@
 
 Review date: 2026-11-04
 
+This historical source comparison and its initial eight-test verification are preserved from the first implementation. For the subsequent HWiNFOterm correctness audit, repairs, expanded validation, and remaining platform acceptance, see [the quality audit](docs/quality-audit-2026-11-04.md).
+
 This assessment is based on the checked-in source in [DashMinimix](https://github.com/techrote/DashMinimix), rather than treating its README as a complete specification. HWiNFOterm was created independently in an initially empty target repository. No DashMinimix source files or implementation code were copied.
 
 ## What the source actually contains
